@@ -28,6 +28,7 @@ namespace Shadowsocks.Controller
         private Thread _trafficThread;
 
         private Listener _listener;
+        private PACDaemon _pacDaemon;
         private PACServer _pacServer;
         private Configuration _config;
         private StrategyManager _strategyManager;
@@ -64,6 +65,7 @@ namespace Shadowsocks.Controller
         public event EventHandler EnableGlobalChanged;
         public event EventHandler ShareOverLANStatusChanged;
         public event EventHandler VerboseLoggingStatusChanged;
+        public event EventHandler ShowPluginOutputChanged;
         public event EventHandler TrafficChanged;
 
         // when user clicked Edit PAC, and PAC file has already created
@@ -150,7 +152,10 @@ namespace Shadowsocks.Controller
 
         public EndPoint GetPluginLocalEndPointIfConfigured(Server server)
         {
-            var plugin = _pluginsByServer.GetOrAdd(server, Sip003Plugin.CreateIfConfigured);
+            var plugin = _pluginsByServer.GetOrAdd(
+                server,
+                x => Sip003Plugin.CreateIfConfigured(x, _config.showPluginOutput));
+
             if (plugin == null)
             {
                 return null;
@@ -251,6 +256,14 @@ namespace Shadowsocks.Controller
             VerboseLoggingStatusChanged?.Invoke(this, new EventArgs());
         }
 
+        public void ToggleShowPluginOutput(bool enabled)
+        {
+            _config.showPluginOutput = enabled;
+            SaveConfig(_config);
+
+            ShowPluginOutputChanged?.Invoke(this, new EventArgs());
+        }
+
         public void SelectServerIndex(int index)
         {
             _config.index = index;
@@ -299,14 +312,14 @@ namespace Shadowsocks.Controller
 
         public void TouchPACFile()
         {
-            string pacFilename = _pacServer.TouchPACFile();
+            string pacFilename = _pacDaemon.TouchPACFile();
 
             PACFileReadyToOpen?.Invoke(this, new PathEventArgs() { Path = pacFilename });
         }
 
         public void TouchUserRuleFile()
         {
-            string userRuleFilename = _pacServer.TouchUserRuleFile();
+            string userRuleFilename = _pacDaemon.TouchUserRuleFile();
 
             UserRuleFileReadyToOpen?.Invoke(this, new PathEventArgs() { Path = userRuleFilename });
         }
@@ -464,31 +477,20 @@ namespace Shadowsocks.Controller
             _config = Configuration.Load();
             StatisticsConfiguration = StatisticsStrategyConfiguration.Load();
 
-            if (privoxyRunner == null)
-            {
-                privoxyRunner = new PrivoxyRunner();
-            }
-            if (_pacServer == null)
-            {
-                _pacServer = new PACServer();
-                _pacServer.PACFileChanged += PacServer_PACFileChanged;
-                _pacServer.UserRuleFileChanged += PacServer_UserRuleFileChanged;
-            }
-            _pacServer.UpdateConfiguration(_config);
-            if (gfwListUpdater == null)
-            {
-                gfwListUpdater = new GFWListUpdater();
-                gfwListUpdater.UpdateCompleted += PacServer_PACUpdateCompleted;
-                gfwListUpdater.Error += PacServer_PACUpdateError;
-            }
+            privoxyRunner = privoxyRunner ?? new PrivoxyRunner();
+
+            _pacDaemon = _pacDaemon ?? new PACDaemon();
+            _pacDaemon.PACFileChanged += PacDaemon_PACFileChanged;
+            _pacDaemon.UserRuleFileChanged += PacDaemon_UserRuleFileChanged;
+            _pacServer = _pacServer ?? new PACServer(_pacDaemon);
+            _pacServer.UpdatePACURL(_config); // So PACServer works when system proxy disabled.
+
+            gfwListUpdater = gfwListUpdater ?? new GFWListUpdater();
+            gfwListUpdater.UpdateCompleted += PacServer_PACUpdateCompleted;
+            gfwListUpdater.Error += PacServer_PACUpdateError;
 
             availabilityStatistics.UpdateConfiguration(this);
-
-            if (_listener != null)
-            {
-                _listener.Stop();
-            }
-
+            _listener?.Stop();
             StopPlugins();
 
             // don't put PrivoxyRunner.Start() before pacServer.Stop()
@@ -499,10 +501,7 @@ namespace Shadowsocks.Controller
             try
             {
                 var strategy = GetCurrentStrategy();
-                if (strategy != null)
-                {
-                    strategy.ReloadServers();
-                }
+                strategy?.ReloadServers();
 
                 StartPlugin();
                 privoxyRunner.Start(_config);
@@ -539,7 +538,6 @@ namespace Shadowsocks.Controller
             }
 
             ConfigChanged?.Invoke(this, new EventArgs());
-
             UpdateSystemProxy();
             Utils.ReleaseMemory(true);
         }
@@ -561,7 +559,7 @@ namespace Shadowsocks.Controller
             SystemProxy.Update(_config, false, _pacServer);
         }
 
-        private void PacServer_PACFileChanged(object sender, EventArgs e)
+        private void PacDaemon_PACFileChanged(object sender, EventArgs e)
         {
             UpdateSystemProxy();
         }
@@ -577,7 +575,7 @@ namespace Shadowsocks.Controller
         }
 
         private static readonly IEnumerable<char> IgnoredLineBegins = new[] { '!', '[' };
-        private void PacServer_UserRuleFileChanged(object sender, EventArgs e)
+        private void PacDaemon_UserRuleFileChanged(object sender, EventArgs e)
         {
             if (!File.Exists(Utils.GetTempPath("gfwlist.txt")))
             {
